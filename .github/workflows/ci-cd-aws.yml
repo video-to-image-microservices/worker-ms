@@ -1,0 +1,104 @@
+name: CI/CD AWS
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: worker-ms-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "705942571235"
+  ECR_REPOSITORY: video-to-image/worker-ms
+  ASG_NAME: worker-ms-asg
+
+jobs:
+  test:
+    name: Testes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: worker_ms
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: worker_ms/pom.xml
+
+      - name: Executar testes
+        run: mvn --batch-mode --no-transfer-progress verify
+
+  deploy:
+    name: Publicar e implantar
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Autenticar na AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.0
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-video-to-image-deploy
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+
+      - name: Login no ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build e push da imagem
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          docker build --tag "$IMAGE:$GITHUB_SHA" --tag "$IMAGE:latest" ./worker_ms
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:latest"
+
+      - name: Iniciar atualização do Auto Scaling
+        id: refresh
+        run: |
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":180,"SkipMatching":false}' \
+            --query 'InstanceRefreshId' \
+            --output text)
+          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Aguardar implantação
+        env:
+          REFRESH_ID: ${{ steps.refresh.outputs.refresh_id }}
+        run: |
+          for attempt in $(seq 1 50); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+            echo "Tentativa $attempt: $STATUS"
+            case "$STATUS" in
+              Successful) exit 0 ;;
+              Failed|Cancelled|RollbackFailed) exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "Timeout aguardando instance refresh"
+          exit 1
