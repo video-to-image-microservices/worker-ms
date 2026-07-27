@@ -35,7 +35,6 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: maven
-          cache-dependency-path: worker_ms/pom.xml
 
       - name: Executar testes
         run: mvn --batch-mode --no-transfer-progress verify
